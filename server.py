@@ -1,6 +1,5 @@
-# server.py — Nano Banana Cloud Web Panel & Image API
-# FastAPI + Web Panel + API Key Auth + SDXL GPU Engine + Cloudflare Tunnel
-import os, time, io, base64, uuid, threading, secrets
+# server.py — Nano Banana Cloud Studio & Internet Face/Character Mimic Engine v3.0
+import os, time, io, base64, uuid, threading, secrets, urllib.request, urllib.parse, json
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -8,10 +7,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import torch
-from diffusers import AutoPipelineForText2Image
+from diffusers import AutoPipelineForText2Image, AutoPipelineForImage2Image
 from PIL import Image
 
-app = FastAPI(title="Nano Banana Web Panel & API", version="2.0.0")
+app = FastAPI(title="Nano Banana Web Mimic & Image API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,69 +21,91 @@ app.add_middleware(
 )
 
 os.makedirs("outputs", exist_ok=True)
+os.makedirs("cache", exist_ok=True)
 app.mount("/images", StaticFiles(directory="outputs"), name="images")
 
-# Global State
-pipe = None
+# Global Pipes
+txt_pipe = None
+img_pipe = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 CONFIG = {
-    "api_key": os.environ.get("NANO_BANANA_KEY", f"sk-banana-{secrets.token_hex(6)}"),
-    "model_name": "nano-banana-v2",
+    "api_key": os.environ.get("NANO_BANANA_KEY", "sk-nanobanana-free"),
     "total_generated": 0,
     "start_time": time.time()
 }
 
 def load_engine():
-    global pipe
-    if pipe is not None:
+    global txt_pipe, img_pipe
+    if txt_pipe is not None:
         return
-    print(f"[*] Loading Nano Banana Image Engine on {device}...")
-    if device == "cuda":
-        pipe = AutoPipelineForText2Image.from_pretrained(
-            "stabilityai/sdxl-turbo",
-            torch_dtype=torch.float16,
-            variant="fp16"
-        ).to("cuda")
-    else:
-        pipe = AutoPipelineForText2Image.from_pretrained(
-            "stabilityai/sdxl-turbo",
-            torch_dtype=torch.float32
-        ).to("cpu")
-    print("[+] Engine online and ready!")
+    print(f"[*] Loading SDXL-Turbo on {device}...")
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    txt_pipe = AutoPipelineForText2Image.from_pretrained(
+        "stabilityai/sdxl-turbo", torch_dtype=dtype, variant="fp16" if device == "cuda" else None
+    ).to(device)
+    img_pipe = AutoPipelineForImage2Image.from_pipe(txt_pipe).to(device)
+    print("[+] Text2Image and Image2Image Face Mimic Engines ready!")
 
 @app.on_event("startup")
 async def startup():
     threading.Thread(target=load_engine, daemon=True).start()
 
 def verify_api_key(authorization: Optional[str] = Header(None)):
-    # If no key set on server, allow all
     if not CONFIG["api_key"]:
         return True
     if not authorization:
-        # Also check query param or header
-        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+        raise HTTPException(status_code=401, detail="Missing Authorization token")
     token = authorization.replace("Bearer ", "").strip()
     if token != CONFIG["api_key"] and token != "sk-nanobanana-free":
         raise HTTPException(status_code=403, detail="Invalid API Key")
     return True
 
+def search_wiki_person(name: str):
+    """Fetch accurate portrait image and physical info from Wikipedia"""
+    try:
+        url = f"https://en.wikipedia.org/w/api.php?action=query&prop=pageimages|extracts&exintro&explaintext&titles={urllib.parse.quote(name)}&pithumbsize=1024&format=json"
+        req = urllib.request.Request(url, headers={"User-Agent": "NanoBananaColab/3.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            pages = data.get("query", {}).get("pages", {})
+            if not pages:
+                return None
+            p = list(pages.values())[0]
+            thumb = p.get("thumbnail", {}).get("source", None)
+            extract = p.get("extract", "")[:300]
+            title = p.get("title", name)
+            return {"title": title, "image_url": thumb, "bio": extract}
+    except Exception as e:
+        print(f"Wiki search error: {e}")
+        return None
+
+def download_image(url: str) -> Image.Image:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return Image.open(io.BytesIO(resp.read())).convert("RGB")
+
 class ImageGenRequest(BaseModel):
     prompt: str
     model: Optional[str] = "nano-banana"
-    n: Optional[int] = 1
     size: Optional[str] = "1024x1024"
     response_format: Optional[str] = "b64_json"
     negative_prompt: Optional[str] = None
     seed: Optional[int] = None
+    # Internet / Face Mimic extensions
+    mimic_person: Optional[str] = None     # e.g. "Elon Musk", "Steve Jobs", "Geralt of Rivia"
+    reference_image_url: Optional[str] = None
+    reference_image_b64: Optional[str] = None
+    strength: Optional[float] = 0.65       # 0.5 - 0.7 preserves face structure while adapting costume/scene
 
 @app.get("/health")
 def health():
     return {
-        "status": "ready" if pipe is not None else "loading",
+        "status": "ready" if txt_pipe is not None else "loading",
         "device": device,
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
-        "total_generated": CONFIG["total_generated"],
-        "uptime": int(time.time() - CONFIG["start_time"])
+        "mimic_enabled": True,
+        "total_generated": CONFIG["total_generated"]
     }
 
 @app.get("/v1/models")
@@ -93,15 +114,22 @@ def models():
         "object": "list",
         "data": [
             {"id": "nano-banana", "object": "model", "owned_by": "ersaz"},
-            {"id": "gemini-imagen", "object": "model", "owned_by": "google"},
+            {"id": "nano-banana-mimic", "object": "model", "owned_by": "ersaz"},
             {"id": "sdxl-turbo", "object": "model", "owned_by": "stabilityai"}
         ]
     }
 
+@app.get("/api/search_person")
+def search_person(q: str):
+    info = search_wiki_person(q)
+    if not info:
+        raise HTTPException(status_code=404, detail="Person/character not found")
+    return info
+
 @app.post("/v1/images/generations")
 async def generate(req: ImageGenRequest, request: Request, auth: bool = Depends(verify_api_key)):
-    global pipe
-    if pipe is None:
+    global txt_pipe, img_pipe
+    if txt_pipe is None:
         raise HTTPException(status_code=503, detail="Model is still loading on GPU. Retry in 10s.")
     
     try:
@@ -113,17 +141,55 @@ async def generate(req: ImageGenRequest, request: Request, auth: bool = Depends(
         
         gen = torch.Generator(device=device).manual_seed(req.seed) if (req.seed is not None and req.seed != -1) else None
         
+        # 1. Face Mimic Internet Look-up
+        ref_image = None
+        prompt = req.prompt
+        
+        # If mimic_person is provided, fetch their real face from Wikipedia/Internet
+        if req.mimic_person and not req.reference_image_url and not req.reference_image_b64:
+            person_info = search_wiki_person(req.mimic_person)
+            if person_info and person_info.get("image_url"):
+                req.reference_image_url = person_info["image_url"]
+                prompt = f"{person_info['title']}, {prompt}"
+        
+        # Load reference image if provided
+        if req.reference_image_url:
+            try:
+                ref_image = download_image(req.reference_image_url).resize((w, h))
+            except Exception as ex:
+                print(f"Failed to download ref image: {ex}")
+        elif req.reference_image_b64:
+            try:
+                img_data = base64.b64decode(req.reference_image_b64)
+                ref_image = Image.open(io.BytesIO(img_data)).convert("RGB").resize((w, h))
+            except Exception as ex:
+                print(f"Failed to decode ref b64: {ex}")
+        
         t0 = time.time()
         with torch.inference_mode():
-            img = pipe(
-                prompt=req.prompt,
-                negative_prompt=req.negative_prompt,
-                num_inference_steps=2,
-                guidance_scale=0.0,
-                width=w,
-                height=h,
-                generator=gen
-            ).images[0]
+            if ref_image is not None and img_pipe is not None:
+                # Run Face Mimic via Image2Image
+                strength = float(req.strength or 0.65)
+                img = img_pipe(
+                    prompt=prompt,
+                    image=ref_image,
+                    strength=strength,
+                    negative_prompt=req.negative_prompt,
+                    num_inference_steps=2,
+                    guidance_scale=0.0,
+                    generator=gen
+                ).images[0]
+            else:
+                # Run Text2Image
+                img = txt_pipe(
+                    prompt=prompt,
+                    negative_prompt=req.negative_prompt,
+                    num_inference_steps=2,
+                    guidance_scale=0.0,
+                    width=w,
+                    height=h,
+                    generator=gen
+                ).images[0]
         duration = round(time.time() - t0, 2)
         
         CONFIG["total_generated"] += 1
@@ -140,14 +206,10 @@ async def generate(req: ImageGenRequest, request: Request, auth: bool = Depends(
             img.save(buf, format="PNG")
             item["b64_json"] = base64.b64encode(buf.getvalue()).decode("utf-8")
             
-        return {
-            "created": int(time.time()),
-            "data": [item]
-        }
+        return {"created": int(time.time()), "data": [item]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Internal API for Web Panel UI (no auth required for local browser)
 @app.post("/panel/generate")
 async def panel_generate(req: ImageGenRequest, request: Request):
     return await generate(req, request, auth=True)
@@ -167,7 +229,7 @@ def dashboard(request: Request):
     <html lang="fa" dir="rtl">
     <head>
       <meta charset="utf-8">
-      <title>Nano Banana Cloud Studio — کنترل پنل و API</title>
+      <title>Nano Banana Studio — هوش مصنوعی با تقلید چهره و اینترنت</title>
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.rtl.min.css" rel="stylesheet">
       <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
@@ -180,6 +242,7 @@ def dashboard(request: Request):
         .btn-banana {{ background: var(--accent); color: #000; font-weight: 700; border: none; border-radius: 10px; }}
         .btn-banana:hover {{ background: #ca8a04; }}
         .code-block {{ background: #080b12; border: 1px solid var(--border); border-radius: 10px; padding: 12px; font-family: monospace; font-size: 13px; color: #38bdf8; direction: ltr; text-align: left; }}
+        .ref-preview {{ width: 80px; height: 80px; object-fit: cover; border-radius: 8px; border: 2px solid var(--accent); display: none; }}
         .gallery-img {{ width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 10px; border: 1px solid var(--border); transition: transform 0.2s; cursor: pointer; }}
         .gallery-img:hover {{ transform: scale(1.03); }}
       </style>
@@ -188,93 +251,108 @@ def dashboard(request: Request):
       <div class="container" style="max-width: 900px;">
         <div class="d-flex justify-content-between align-items-center mb-4">
           <div>
-            <h3 class="mb-1 text-warning"><i class="fa-solid fa-bolt"></i> Nano Banana Cloud Studio</h3>
-            <p class="text-secondary small mb-0">موتور اختصاصی و رایگان ساخت تصویر روی GPU گوگل کلب • متصل به Minis</p>
+            <h3 class="mb-1 text-warning"><i class="fa-solid fa-masks-theater"></i> Nano Banana Mimic Studio</h3>
+            <p class="text-secondary small mb-0">موتور متصل به اینترنت جهت تقلید دقیق چهره، کاراکتر و سوژه‌ها • روی GPU کلب</p>
           </div>
-          <span class="badge bg-success py-2 px-3"><i class="fa-solid fa-circle-check"></i> وضعیت: آنلاین</span>
+          <span class="badge bg-success py-2 px-3"><i class="fa-solid fa-globe"></i> اینترنت: متصل</span>
         </div>
 
-        <ul class="nav nav-pills mb-4 nav-justified" id="pills-tab" role="tablist">
-          <li class="nav-item"><button class="nav-link active" data-bs-toggle="pill" data-bs-target="#tab-studio"><i class="fa-solid fa-wand-magic-sparkles"></i> استودیو تصویر</button></li>
-          <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-api"><i class="fa-solid fa-key"></i> کلید API و تنظیمات Minis</button></li>
-          <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-gallery" onclick="loadGallery()"><i class="fa-solid fa-images"></i> گالری تصاویر</button></li>
+        <ul class="nav nav-pills mb-4 nav-justified" id="pills-tab">
+          <li class="nav-item"><button class="nav-link active" data-bs-toggle="pill" data-bs-target="#tab-studio"><i class="fa-solid fa-wand-magic-sparkles"></i> استودیو ساخت و تقلید چهره</button></li>
+          <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-api"><i class="fa-solid fa-code"></i> پارامترهای API برای مینیس</button></li>
+          <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-gallery" onclick="loadGallery()"><i class="fa-solid fa-images"></i> گالری</button></li>
         </ul>
 
-        <div class="tab-content" id="pills-tabContent">
+        <div class="tab-content">
           <!-- TAB 1: STUDIO -->
           <div class="tab-pane fade show active" id="tab-studio">
             <div class="card p-4">
-              <div class="mb-3">
-                <label class="form-label fw-bold">پرامپت تصویر (انگلیسی یا فارسی):</label>
-                <textarea id="prompt" class="form-control bg-dark text-light border-secondary" rows="3" placeholder="a cinematic glowing cybernetic banana in futuristic neon Tokyo, ultra detailed 8k"></textarea>
+              <!-- Internet Face Search Box -->
+              <div class="p-3 mb-3 rounded" style="background: #0f172a; border: 1px dashed #38bdf8;">
+                <label class="form-label fw-bold text-info small"><i class="fa-solid fa-magnifying-glass"></i> جستجوی چهره/شخصیت در اینترنت (اختیاری):</label>
+                <div class="input-group mb-2">
+                  <input type="text" id="person-query" class="form-control bg-dark text-light border-secondary" placeholder="نام شخص یا کاراکتر (مثال: Elon Musk, Steve Jobs, Geralt of Rivia)...">
+                  <button class="btn btn-outline-info" type="button" onclick="fetchPerson()"><i class="fa-solid fa-cloud-arrow-down"></i> دریافت چهره از وب</button>
+                </div>
+                <div class="d-flex align-items-center gap-3 mt-2" id="ref-status-box" style="display:none !important;">
+                  <img id="ref-preview-img" class="ref-preview" src="">
+                  <div class="small text-secondary">
+                    <span id="ref-title" class="fw-bold text-light"></span><br>
+                    <span id="ref-bio" class="text-truncate d-inline-block" style="max-width: 400px;"></span>
+                  </div>
+                </div>
               </div>
+
+              <div class="mb-3">
+                <label class="form-label fw-bold">پرامپت تغییر و سناریوی تصویر:</label>
+                <textarea id="prompt" class="form-control bg-dark text-light border-secondary" rows="3" placeholder="در نقش جنگجوی سامورایی در توکیوی باستان، نورپردازی سینمایی، کیفیت 8k..."></textarea>
+              </div>
+
               <div class="row g-3 mb-3">
-                <div class="col-md-6">
-                  <label class="form-label small text-secondary">نسبت ابعاد (Aspect Ratio):</label>
+                <div class="col-md-4">
+                  <label class="form-label small text-secondary">نسبت ابعاد:</label>
                   <select id="size" class="form-select bg-dark text-light border-secondary">
-                    <option value="1024x1024">1:1 مربع (1024x1024)</option>
-                    <option value="1024x576">16:9 عریض (1024x576)</option>
-                    <option value="576x1024">9:16 استوری/موبایل (576x1024)</option>
+                    <option value="1024x1024">1:1 مربع</option>
+                    <option value="1024x576">16:9 عریض</option>
+                    <option value="576x1024">9:16 استوری</option>
                   </select>
                 </div>
-                <div class="col-md-6">
-                  <label class="form-label small text-secondary">موتور (Model):</label>
-                  <input class="form-control bg-dark text-light border-secondary" value="nano-banana (SDXL-Turbo)" readonly>
+                <div class="col-md-4">
+                  <label class="form-label small text-secondary">میزان وفاداری به چهره (Strength):</label>
+                  <select id="strength" class="form-select bg-dark text-light border-secondary">
+                    <option value="0.60">بسیار شبیه (حفظ حداکثر چهره)</option>
+                    <option value="0.65" selected>متعادل (بهترین ترکیب چهره و استایل)</option>
+                    <option value="0.75">تغییر بالا (آزادی بیشتر هوش مصنوعی)</option>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label small text-secondary">موتور:</label>
+                  <input class="form-control bg-dark text-light border-secondary" value="SDXL Mimic (T4 GPU)" readonly>
                 </div>
               </div>
+
               <button id="gen-btn" class="btn btn-banana py-2 w-100" onclick="generate()">
-                <i class="fa-solid fa-play"></i> تولید آنی تصویر (۱ الی ۲ ثانیه)
+                <i class="fa-solid fa-play"></i> رندر با تقلید چهره و کاراکتر 🚀
               </button>
 
               <div id="loader" class="text-center py-4" style="display:none;">
                 <div class="spinner-border text-warning" role="status"></div>
-                <p class="text-secondary small mt-2">در حال پردازش سریع روی گرافیک...</p>
+                <p class="text-secondary small mt-2">در حال ترکیب چهره واقعی با سناریو در ۲ ثانیه...</p>
               </div>
 
               <div id="result-box" class="mt-4 text-center" style="display:none;">
                 <img id="result-img" class="img-fluid rounded border border-secondary" style="max-height: 500px;" src="">
                 <div class="mt-2 text-secondary small" id="result-meta"></div>
                 <div class="mt-3">
-                  <a id="download-btn" href="" download="nano_banana.png" class="btn btn-outline-light btn-sm"><i class="fa-solid fa-download"></i> دانلود تصویر</a>
+                  <a id="download-btn" href="" download="mimic.png" class="btn btn-outline-light btn-sm"><i class="fa-solid fa-download"></i> دانلود تصویر</a>
                 </div>
               </div>
             </div>
           </div>
 
-          <!-- TAB 2: API & MINIS -->
+          <!-- TAB 2: API -->
           <div class="tab-pane fade" id="tab-api">
             <div class="card p-4">
-              <h5 class="text-warning mb-3"><i class="fa-solid fa-plug"></i> مشخصات API جهت اتصال دائمی</h5>
+              <h5 class="text-warning mb-3"><i class="fa-solid fa-code"></i> نحوه ارسال از مینیس یا کد پایتون</h5>
+              <p class="text-secondary small">می‌توانید مستقیماً پارامتر <code>mimic_person</code> را بفرستید تا سرور خودکار عکس شخص را از اینترنت دانلود کند و چهره‌اش را بازتولید کند:</p>
               
-              <div class="mb-3">
-                <label class="form-label text-secondary small">API Endpoint (OpenAI Format):</label>
-                <div class="code-block">{base_url}/v1</div>
-              </div>
-
-              <div class="mb-3">
-                <label class="form-label text-secondary small">API Key اختصاصی شما:</label>
-                <div class="code-block">{key}</div>
-              </div>
-
-              <h6 class="mt-4 fw-bold">اتصال مستقیم به Minis:</h6>
-              <p class="text-secondary small">این دستور را در چت یا شل Minis اجرا کنید تا پرووایدر با آدرس جدید سینک شود:</p>
-              <div class="code-block">minis-config set providers.65401b6b-7d1f-44ad-bbe4-00e1f4d654de.customBaseURL "{base_url}/v1"</div>
-
-              <h6 class="mt-4 fw-bold">تست با cURL:</h6>
               <div class="code-block">curl -X POST "{base_url}/v1/images/generations" \\
   -H "Authorization: Bearer {key}" \\
   -H "Content-Type: application/json" \\
-  -d '{{"prompt": "neon banana in cyberspace", "size": "1024x1024"}}'</div>
+  -d '{{
+    "prompt": "wearing futuristic golden cyberpunk armor, cinematic lighting 8k",
+    "mimic_person": "Elon Musk",
+    "strength": 0.65,
+    "size": "1024x1024"
+  }}'</div>
             </div>
           </div>
 
           <!-- TAB 3: GALLERY -->
           <div class="tab-pane fade" id="tab-gallery">
             <div class="card p-4">
-              <h5 class="text-warning mb-3"><i class="fa-solid fa-images"></i> آخرین تصاویر تولید شده</h5>
-              <div class="row g-3" id="gallery-grid">
-                <p class="text-secondary">در حال بارگذاری...</p>
-              </div>
+              <h5 class="text-warning mb-3"><i class="fa-solid fa-images"></i> تصاویر اخیر</h5>
+              <div class="row g-3" id="gallery-grid"><p class="text-secondary">در حال بارگذاری...</p></div>
             </div>
           </div>
         </div>
@@ -282,6 +360,33 @@ def dashboard(request: Request):
 
       <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
       <script>
+        let currentRefUrl = '';
+
+        async function fetchPerson() {{
+          const q = document.getElementById('person-query').value.trim();
+          if(!q) return alert('نام شخص را وارد کنید');
+          try {{
+            const res = await fetch('/api/search_person?q=' + encodeURIComponent(q));
+            if(!res.ok) throw new Error('یافت نشد');
+            const data = await res.json();
+            if(data.image_url) {{
+              currentRefUrl = data.image_url;
+              document.getElementById('ref-preview-img').src = currentRefUrl;
+              document.getElementById('ref-preview-img').style.display = 'block';
+              document.getElementById('ref-title').innerText = data.title;
+              document.getElementById('ref-bio').innerText = data.bio;
+              document.getElementById('ref-status-box').style.setProperty('display', 'flex', 'important');
+              if(!document.getElementById('prompt').value) {{
+                document.getElementById('prompt').value = data.title + ' in cyberpunk style, highly detailed 8k';
+              }}
+            }} else {{
+              alert('عکسی برای این شخصیت یافت نشد.');
+            }}
+          }} catch(e) {{
+            alert('خطا در جستجو: ' + e.message);
+          }}
+        }}
+
         async function generate() {{
           const p = document.getElementById('prompt').value.trim();
           if(!p) return alert('لطفاً پرامپت را وارد کنید');
@@ -290,27 +395,34 @@ def dashboard(request: Request):
           document.getElementById('result-box').style.display = 'none';
 
           try {{
+            const body = {{
+              prompt: p,
+              size: document.getElementById('size').value,
+              strength: parseFloat(document.getElementById('strength').value),
+              response_format: 'url'
+            }};
+            if(currentRefUrl) {{
+              body.reference_image_url = currentRefUrl;
+            }} else if(document.getElementById('person-query').value.trim()) {{
+              body.mimic_person = document.getElementById('person-query').value.trim();
+            }}
+
             const res = await fetch('/panel/generate', {{
               method: 'POST',
               headers: {{ 'Content-Type': 'application/json' }},
-              body: JSON.stringify({{
-                prompt: p,
-                size: document.getElementById('size').value,
-                response_format: 'url'
-              }})
+              body: JSON.stringify(body)
             }});
             const data = await res.json();
             if(data.data && data.data[0].url) {{
-              const url = data.data[0].url;
-              document.getElementById('result-img').src = url;
-              document.getElementById('download-btn').href = url;
-              document.getElementById('result-meta').innerText = 'زمان تولید: ' + (data.data[0].duration || '1.2') + ' ثانیه';
+              document.getElementById('result-img').src = data.data[0].url;
+              document.getElementById('download-btn').href = data.data[0].url;
+              document.getElementById('result-meta').innerText = 'زمان رندر: ' + (data.data[0].duration || '1.5') + ' ثانیه';
               document.getElementById('result-box').style.display = 'block';
             }} else {{
-              alert('خطا: ' + (data.detail || 'مشکلی رخ داد'));
+              alert('خطا: ' + (data.detail || 'تولید نشد'));
             }}
           }} catch(e) {{
-            alert('خطای اتصال: ' + e);
+            alert('خطا: ' + e);
           }} finally {{
             document.getElementById('gen-btn').disabled = false;
             document.getElementById('loader').style.display = 'none';
@@ -322,20 +434,12 @@ def dashboard(request: Request):
           try {{
             const res = await fetch('/panel/gallery');
             const items = await res.json();
-            if(items.length === 0) {{
-              grid.innerHTML = '<p class=\"text-secondary\">هنوز تصویری ساخته نشده است.</p>';
-              return;
-            }}
             grid.innerHTML = items.map(it => `
               <div class=\"col-4 col-md-3\">
-                <a href=\"${{it.url}}\" target=\"_blank\">
-                  <img src=\"${{it.url}}\" class=\"gallery-img\">
-                </a>
+                <a href=\"${{it.url}}\" target=\"_blank\"><img src=\"${{it.url}}\" class=\"gallery-img\"></a>
               </div>
             `).join('');
-          }} catch(e) {{
-            grid.innerHTML = '<p class=\"text-danger\">خطا در دریافت تصاویر</p>';
-          }}
+          }} catch(e) {{}}
         }}
       </script>
     </body>
